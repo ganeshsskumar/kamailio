@@ -408,11 +408,6 @@ int flow_description_exists(rx_authsessiondata_t *session_data, int stream_num,
 	}
 
 	while(fd) {
-		/* Compare stream number. */
-		if(fd->stream_num != stream_num) {
-			fd = fd->next;
-			continue;
-		}
 
 		/* Compare direction. */
 		if(fd->direction != direction) {
