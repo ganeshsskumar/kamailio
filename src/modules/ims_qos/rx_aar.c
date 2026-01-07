@@ -530,8 +530,11 @@ int add_media_components(AAAMessage *aar, struct sip_msg *req,
 	int request_originated_from_callee = 0;
 	str ipA, ipB, portA, portB;
 	// New flow descriptions are added hence it wont be added directly to the currently active flow description list until dialog is confirmed.
-	int in_current_flow_description_list = 0;
-
+	int in_current_flow_description_list = 1;
+    /* VIDEO downgrade handling */
+    int video_now_present = 0;
+    int video_downgrade = 0;
+	
 	rx_authsessiondata_t *p_session_data = 0;
 	p_session_data = (rx_authsessiondata_t *)auth->u.auth.generic_data;
 
@@ -588,6 +591,11 @@ int add_media_components(AAAMessage *aar, struct sip_msg *req,
 				int intportA = atoi(req_sdp_stream->port.s);
 				int intportB = atoi(rpl_sdp_stream->port.s);
 				if(intportA != 0 && intportB != 0) {
+					/* Detect presence of video in current SDP */
+                    if(req_sdp_stream->media.len == 5 &&
+                       strncmp(req_sdp_stream->media.s, "video", 5) == 0) {
+                        video_now_present = 1;
+                    }
 					if(!authorize_video_flow) {
 						if(strncmp(req_sdp_stream->media.s, "video", 5) == 0) {
 							add_flow = 0;
@@ -680,7 +688,8 @@ int add_media_components(AAAMessage *aar, struct sip_msg *req,
 							}
 						}
 
-						if(!flow_description_exists(p_session_data,
+						
+						if(video_downgrade ||!flow_description_exists(p_session_data,
 								   sdp_stream_num + 1, &req_sdp_stream->media,
 								   &ipA, &portA, &ipB, &portB,
 								   &rpl_sdp_stream->transport, direction,
@@ -708,9 +717,22 @@ int add_media_components(AAAMessage *aar, struct sip_msg *req,
 				}
 			}
 		}
+		/* Detect VIDEO → AUDIO downgrade (once per request) */
+        if(p_session_data->has_video && !video_now_present) {
+            LM_DBG("RxAAR: Video → Audio downgrade detected\n");
+            video_downgrade = 1;
+        }
+
+        /* Remove old video flow */
+        if(video_downgrade) {
+            rx_remove_video_flows(p_session_data);
+        }
+		
 		sdp_session_num++;
 	}
 
+	p_session_data->has_video = video_now_present;
+	
 	free_sdp((sdp_info_t **)(void *)&req->body);
 	free_sdp((sdp_info_t **)(void *)&rpl->body);
 
@@ -721,6 +743,41 @@ error:
 	return 0;
 }
 
+/*
+ * Remove existing video flow descriptions from current flow list
+ * Used during video → audio downgrade
+ */
+void rx_remove_video_flows(rx_authsessiondata_t *session_data)
+{
+    flow_description_t *fd;
+    flow_description_t *prev = NULL;
+
+    if(!session_data) {
+        return;
+    }
+
+    fd = session_data->first_current_flow_description;
+
+    while(fd) {
+        if(fd->media.len == 5 &&
+           strncmp(fd->media.s, "video", 5) == 0) {
+
+            LM_DBG("Rx: Removing video flow description");
+
+            if(prev) {
+                prev->next = fd->next;
+            } else {
+                session_data->first_current_flow_description = fd->next;
+            }
+
+            /* If memory is dynamically allocated, free fd here if required */
+            return; /* only one video flow expected */
+        }
+
+        prev = fd;
+        fd = fd->next;
+    }
+}
 /**
  * Sends the Authorization Authentication Request - specifically this is an asynchronous AAR sent if another update adding video has failed so we need to remove video
  */
