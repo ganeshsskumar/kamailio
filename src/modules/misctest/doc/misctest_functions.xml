@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE section PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
+   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+
+<section id="misctest.functions" xmlns:xi="http://www.w3.org/2001/XInclude">
+	<sectioninfo>
+	</sectioninfo>
+
+	<title>Functions</title>
+
+	<section id="misctest.mt_mem_alloc">
+		<title><function>mt_mem_alloc(size)</function></title>
+		<para>
+			Allocates size bytes.
+		</para>
+		<note><para>This is a debugging function for simulating memory
+					leaks or stressing the memory allocator. It should not
+					be used in production setups
+		</para></note>
+		<example>
+			<title><function>men_alloc</function> usage</title>
+			<programlisting>
+...
+mem_alloc(1048576); # 1MB
+...
+			</programlisting>
+		</example>
+	</section>
+
+	<section id="misctest.mt_mem_free">
+		<title><function>mt_mem_free()</function></title>
+		<para>
+			Frees all the memory allocated with mem_alloc() up to this
+			point.
+		</para>
+		<note><para>This is a debugging function for simulating memory
+					leaks or stressing the memory allocator. It should not
+					be used in production setups
+		</para></note>
+		<example>
+			<title><function>mem_free</function> usage</title>
+			<programlisting>
+...
+mem_free();
+...
+			</programlisting>
+		</example>
+	</section>
+
+	<section id="misctest.mt_tcp_thread_exec">
+		<title><function>mt_tcp_thread_exec(text)</function></title>
+		<para>
+			Print the text via the tcp main process threads.
+		</para>
+		<note>
+			<para>
+				This is a debugging function for simulating execution on
+				tcp main process threads. It should not
+				be used in production setups
+			</para>
+		</note>
+		<example>
+			<title><function>mt_tcp_thread_exec</function> usage</title>
+			<programlisting>
+...
+mt_tcp_thread_exec("request $rm uri $ru");
+...
+			</programlisting>
+		</example>
+	</section>
+
+	<section id="misctest.mt_lock_test">
+		<title>
+			<function>mt_lock_test(count)</function>
+		</title>
+		<para>
+			Lock and unlock the global lock count times.
+		</para>
+		<note>
+			<para>
+				This is a debugging function for simulating locking and unlocking of global lock.
+				It should not be used in production setups
+			</para>
+		</note>
+		<example>
+			<title>
+				<function>mt_lock_test</function> usage</title>
+			<programlisting>
+...
+mt_lock_test(100000000);
+...
+			</programlisting>
+		</example>
+	</section>
+
+	<section id="misctest.mt_lock_threads">
+		<title>
+			<function>mt_lock_threads(nrthreads)</function>
+		</title>
+		<para>
+			Creates a set of threads that try to use the internal lock (see
+			also lock_threads_mode parameter).
+		</para>
+		<note>
+			<para>
+				This is a debugging function to do locking and unlocking
+				of an internal global lock from threads. It should not be used
+				in production setups.
+			</para>
+		</note>
+		<example>
+			<title>
+				<function>mt_lock_threads</function> usage</title>
+			<programlisting>
+...
+mt_lock_threads("4");
+...
+			</programlisting>
+		</example>
+	</section>
+	<section id="misctest.mt_unlock_threads">
+		<title>
+			<function>mt_unlock_threads(nrops)</function>
+		</title>
+		<para>
+			Unlock the internal global lock used by mt_lock_threads(). It is
+			done nrops-times.
+		</para>
+		<note>
+			<para>
+				This is a debugging function to do locking and unlocking
+				of an internal global lock from threads. It should not be used
+				in production setups.
+			</para>
+		</note>
+		<example>
+			<title>
+				<function>mt_lock_threads</function> usage</title>
+			<programlisting>
+...
+mt_unlock_threads("4");
+...
+			</programlisting>
+		</example>
+	</section>
+</section>

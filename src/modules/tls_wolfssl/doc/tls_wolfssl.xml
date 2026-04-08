@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE section PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
+"http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd"
+[ <!ENTITY % local.common.attrib
+"xmlns:xi CDATA #FIXED 'http://www.w3.org/2001/XInclude'">
+<!ENTITY % docentities SYSTEM "../../../../doc/docbook/entities.xml">
+<!ENTITY tls-url '<ulink url="https://kamailio.org/docs/modules/stable/modules/tls.html">tls</ulink>'>
+<!ENTITY tls-options '<ulink url="https://kamailio.org/docs/modules/stable/modules/tls.html#tls.r.tls.options">tls.options</ulink>'>
+%docentities;
+
+]>
+
+<book id="tls" xmlns:xi="http://www.w3.org/2001/XInclude">
+	<bookinfo>
+		<title>wolfSSL TLS Module</title>
+		<authorgroup>
+			<author>
+	<firstname>Shih-Ping</firstname>
+	<surname>Chan</surname>
+	<address>
+		<email>shihping.chan@gmail.com</email>
+	</address>
+			</author>
+		</authorgroup>
+		<copyright>
+			<year>2022</year>
+			<holder>Chan Shih-Ping</holder>
+		</copyright>
+	</bookinfo>
+	<toc></toc>
+
+	<chapter>
+		<title>Admin Guide</title>
+		<section id="tls_wolfssl.overview">
+			<title>Overview</title>
+			<para>
+	This module implements the TLS transport for &kamailio;
+	using the <ulink url="https://www.wolfssl.com">wolfSSL library</ulink>
+	(https://www.wolfssl.com). To enable it, the module must be configured and
+        loaded and the <emphasis>enable_tls=yes</emphasis> core setting
+	must set. This module is mutually exclusive
+        with the <emphasis>tls</emphasis> module.
+			</para>
+			<para>
+	It is highly recommended to run this module with MT-mode (<code>tcp_main_threads = 1</code>).
+			</para>
+			<para>
+	This module is derived from the &tls-url;
+	module and adapted to wolfSSL.
+	Credit goes to the authors of the tls module.
+			</para>
+			<para>
+	This module builds from wolfSSl 5.2.0 onwards. There is a git submodule that
+	contains a recent version of wolfSSL for easier building.
+			</para>
+			<para>
+	This user is referred to the documentation of the &tls-url; module for configuration
+	and other information. Not all configuration keys are implemented (e.g., protocol
+	versions — defaults to 1.2+ and cipher suites).
+			</para>
+		</section>
+		<section id="tls_wolfssl.quick_start">
+			<title>Quick Start</title>
+			<para>
+	The default &kamailioconfig; file has basic TLS support included, it has to
+	be enabled with "#!define WITH_TLS" directive.
+			</para>
+			<example>
+	<title>Quick Start Basic Config</title>
+	<programlisting>
+...
+#...
+loadmodule "sl.so"
+loadmodule "tls_wolfssl.so"
+#... refer to Quick Start of tls module
+#... for further configuration
+...
+	</programlisting>
+			</example>
+		</section>
+
+		<section id="tls_wolfssl.notes">
+			<title>Important Notes</title>
+			<para>
+	The wolfSSL TLS module is intended to be compiled with a
+	recent version of wolfSSL - 5.8.4+ is recommended.
+			</para>
+			<para>Kamailio shared memory allocators, used in MP-mode(<code>tcp_main_threads = 0</code>), support
+                        16-byte alignment - it is possible to use this module with either the internal submodule
+                        or distro provided packages. For reference the ideal build flags are:
+
+                        <programlisting>
+...
+# - this assumes the allocators are 16-byte aligned
+# - Debian currently does not use -DWOLF_CRYPTO_CB_RSA_PAD: this affects use of RSA
+#   padding mechanisms on HSMs
+EXTRA_CFLAGS="-g -O2 -DWOLF_CRYPTO_CB_RSA_PAD" ./configure --enable-distro --enable-pkcs11
+...
+                        </programlisting>
+			</para>
+		</section>
+
+
+		<section id="tls_wolfssl.compile">
+			<title>Compiling the wolfSSL TLS Module</title>
+			<para> The development package for wolfSSL is required (libwolfssl-dev or equivalent).
+                        The module requires PKCS#11 support so <code>-DHAVE_PKCS11</code> must be used in building
+                        the library (e.g. Debian/Ubuntu).
+			</para>
+			<para>
+	In most case compiling the wolfSSL TLS module is as simple as:
+
+	<programlisting>
+...
+make -C modules/tls_wolfssl
+# to use the internal git submodule
+make -C src WOLFSSL_INTERNAL=yes module_group_more="tls_wolfssl" group_include=more every-module
+# cmake
+cd build; make tls_wolfssl
+cd build; make WOLFSSL_INTERNAL=ON tls_wolfssl
+...
+	</programlisting>
+
+		        </para>
+		</section>
+		<section id="tls.pkcs11">
+			<sectioninfo></sectioninfo>
+			<title>Support for externalized keys (PKCS#11)</title>
+
+                        <para>The module supports loading keys from PKCS#11 and
+                        up to 8 tokens are supported.
+                        This feature is available in both MT- and MP- modes.
+                        The key naming convention follows <ulink url="https://www.rfc-editor.org/rfc/rfc7512.html">RFC 7512 (PKCS#11 URI)</ulink>:
+                        <programlisting>
+...
+# - in tls.cfg these pseudo-file names to refer to PKCS#11 keys
+# - this format is a subset of RFC 7512
+# The prefix /uri: is for tls_wolfssl to recognise PKCS#11 - it
+# is stripped off before parsing the key
+# 
+private_key = /uri:pkcs11:token=MyToken;object=MyPrivateKey?module-path=/usr/lib64/libsoftokn3.so&amp;pin-value=12345678[pin-source=....]
+...
+                        </programlisting>
+
+                        The string value itself cannot contain spaces so, e.g <code>token=NSS%20Certificate%20DB</code>,
+                        allows URL-encoding. The <literal>pin-source</literal> parameter supports redirection for security:
+    <itemizedlist>
+      <listitem><para><literal>pin-source=file:/path/to/pin</literal> (Read from file)</para></listitem>
+      <listitem><para><literal>pin-source=env:MY_PIN_VAR</literal> (Read from environment)</para></listitem>
+    </itemizedlist>
+
+                        </para>
+		</section>
+
+		<section id="tls.rpc">
+			<sectioninfo></sectioninfo>
+			<title>Additional RPC Commands</title>
+			<para>Supports the same RPC command as the tls module with some additions.</para>
+			<section id="tls.r.tls.domains">
+	<title><function>tls.domains</function></title>
+	<para>
+		Lists internal domain configuration that was configured in <filename>tls.cfg</filename>.
+		Complements &tls-options;, see the &tls-url; module,
+		which retrieves TLS settings directly from the Kamailio routing script.
+	</para>
+			</section>
+		</section>
+	</chapter>
+</book>

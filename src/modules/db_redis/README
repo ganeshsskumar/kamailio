@@ -1,0 +1,555 @@
+DB_REDIS Module
+
+Andreas Granig
+
+   <agranig@sipwise.com>
+
+Edited by
+
+Andreas Granig
+
+   <agranig@sipwise.com>
+
+Alex Balashov
+
+   <abalashov@evaristesys.com>
+
+Joel Centelles Martin
+
+   <joel_centellesmartin@baxter.com>
+
+Donat Zenichev
+
+   <dzenichev@sipwise.com>
+
+   Copyright © 2018 sipwise.com
+     __________________________________________________________________
+
+   Table of Contents
+
+   1. Admin Guide
+
+        1. Overview
+        2. Limitations
+        3. Dependencies
+
+              3.1. Kamailio Modules
+              3.2. External Libraries or Applications
+
+        4. Parameters
+
+              4.1. schema_path (string)
+              4.2. keys (string)
+              4.3. verbosity (int)
+              4.4. opt_tls (int)
+              4.5. max_key_length (int)
+              4.6. mapping_struct_type (int)
+              4.7. hash_value (string)
+              4.8. hash_expires (int)
+              4.9. db_pass (string)
+              4.10. ca_path (string)
+              4.11. with_sentinels (int)
+              4.12. sentinels_config (string)
+              4.13. redis_master_name (string)
+              4.14. use_replicas (int)
+              4.15. recheck_replicas_interval (int)
+
+        5. Usage
+        6. Module Specific Considerations
+
+              6.1. usrloc
+
+   List of Examples
+
+   1.1. Setting schema_path module parameter
+   1.2. Setting keys module parameter
+   1.3. Setting verbosity module parameter
+   1.4. Enabling TLS connection
+   1.5. Limiting the max key length
+   1.6. Enabling redis hashes
+   1.7. Setting hash_value
+   1.8. Setting hash expires
+   1.9. Setting a password
+   1.10. Setting CA path
+   1.11. Enabling sentinels
+   1.12. Setting sentinels
+   1.13. Setting Redis master name
+   1.14. Setting use_replicas
+   1.15. Setting use_replicas
+   1.16. Usage
+   1.17. Usage
+
+Chapter 1. Admin Guide
+
+   Table of Contents
+
+   1. Overview
+   2. Limitations
+   3. Dependencies
+
+        3.1. Kamailio Modules
+        3.2. External Libraries or Applications
+
+   4. Parameters
+
+        4.1. schema_path (string)
+        4.2. keys (string)
+        4.3. verbosity (int)
+        4.4. opt_tls (int)
+        4.5. max_key_length (int)
+        4.6. mapping_struct_type (int)
+        4.7. hash_value (string)
+        4.8. hash_expires (int)
+        4.9. db_pass (string)
+        4.10. ca_path (string)
+        4.11. with_sentinels (int)
+        4.12. sentinels_config (string)
+        4.13. redis_master_name (string)
+        4.14. use_replicas (int)
+        4.15. recheck_replicas_interval (int)
+
+   5. Usage
+   6. Module Specific Considerations
+
+        6.1. usrloc
+
+1. Overview
+
+   This module provides a DB APIv1 connector for the Redis server
+   (https://www.redis.io).
+
+   It can be used as a replacement for other database modules such as
+   db_mysql and db_postgres. Not all the specs of DB APIv1 are
+   implemented, thus the usage of this module might be restricted to
+   specific modules. Also, for proper performance, this module needs
+   particular configuration tailored to the modules that make use of it.
+
+   Since Redis does not provide a schema by itself, db_redis ships with
+   schema files. The path to these has to be defined using the module
+   parameter "schema_path". The schema definition is defined in one file
+   per table, such that the file name corresponds to the table name, and
+   each file is composed of a comma-separated list of column definitions
+   in the format <column-name>/<type>[,<column-name>/<type> ...] in one
+   line, followed by a line holding the table version.
+
+   Example definition for the "location" table (from the usrloc module):
+username/string,domain/string,contact/string,received/string,path/string,expires
+/timestamp,q/double,callid/string,cseq/int,last_modified/timestamp,flags/int,cfl
+ags/int,user_agent/string,socket/string,methods/int,ruid/string,reg_id/int,insta
+nce/string,server_id/int,connection_id/int,keepalive/int,partition/int
+8
+
+   Because Redis is a key-value store, it requires unique keys. This means
+   that tables and rows from a relational SQL database, e.g. from MySQL,
+   can not be ported one a 1:1 basis to Redis.
+
+   For instance, usrloc relies on a key of "username@domain", but in order
+   to store multiple contacts per AoR, it cannot be constrained to
+   uniqueness. To work around this, db_redis supports mapping structures
+   (either sets or hashes). If sets are chosen, in the case of the usrloc
+   module for example, one would have a set with a key of
+   "username@domain" and its entries being unique keys per contact based
+   on the ruid of a contact. Thus, one contact in usrloc consists of a
+   unique key "location:entry::example-ruid-1" being a hash with the
+   columns like username, domain, contact, path etc. In addition, this
+   unique key is stored in a set
+   "location:usrdom::exampleuser:exampledomain.org". When usrloc does a
+   lookup based on "username@domain", db_redis figures out via the
+   keys/values the query constructed by usrloc to look for the final entry
+   key in the mapping set first. It then query the actual entries from
+   there, avoiding full table scans. For usrloc, the same holds true for
+   expired contacts, requiring a different kind of mapping. There is a
+   certain balance of read performance vs. write performance to consider,
+   because inserts and deletes also have to maintain the mappings, though
+   this yields much faster selects. The mappings can be freely defined, so
+   even though other kamailio modules don't require a specific mapping to
+   be in place for proper performance, mappings could be defined for
+   external applications to read faster (for instance letting the acc
+   module also write mappings besides the actual records for billing
+   systems to correlate start and stop records faster).
+
+   The key is always prefixed with 'tablename:entry::'. For example the
+   record in 'subscriber' table for user 'alice@sip.com' has the key:
+   'subscriber:entry::alice:sip.com'. If all the records are just loaded
+   at startup (or all reloaded at runtime), the key can just be made
+   unique using whatever values added after 'tablename:entry::' prefix.
+   For example, keys for 'address' table records can be:
+   'address:entry::1', address:entry::2', address:entry::3', ... No 'keys'
+   modparam of 'db_redis' for 'address' table needs to be defined.
+
+   Important Note: at this moment the module requires at least one 'keys'
+   parameter, but it does not need to be related to the table loaded from
+   Redis server -- for example, if used only for permissions module with
+   'address' table, then the 'keys' parameter can be specified for
+   'version' table. However, if it used for a module that inserts or
+   updates the records in database table, the key for entry must be
+   defined for that table.
+
+   The mappings can be freely defined in the "keys" module parameter,
+   which is composed of a semi-colon separated list of definitions in the
+   format
+   <table-name>=<entry>:<column-name>[&<map-name>:<column-name>,<column-na
+   me>...]. Each table must at least have an "entry" key for db_redis to
+   be able to store data.
+
+   Example:
+location=entry:ruid&usrdom:username,domain&timer:partition,keepalive;acc=entry:c
+allid,time_hires&cid:callid
+
+   For readability purposes, definitions of keys per table can span
+   multiple Kamailio config lines by providing multiple "keys" modparams.
+
+   When the mapping structure is selected to be hash, one contact in
+   usrloc consists of the same unique key "location:entry::example-ruid-1"
+   as before, but now this unique key is also a key in the hash
+   "location:usrdom::exampleuser:exampledomain.org". The value associated
+   with this key is whatever module param hash_value is set to. When
+   usrloc does a lookup based on "username@domain", db_redis goes through
+   the keys in the hash "location:usrdom::exampleuser:exampledomain.org"
+   to retrieve the associated contact keys. All the other mapping
+   structures that used to be sets are now hashes as well (index::timer,
+   location:timer). This possibility of using hashes has only been tested
+   for usrloc and was introduced because from Redis v 7.4.0 onwards the
+   HEXPIRE command is available, which allows expiring individual keys
+   inside a hash. This makes the process of expiring contacts something
+   that Redis itself can handle, without the need for Kamailio to do it.
+
+   Example of structures inside Redis for the usrloc module, with mapping
+   structure type 1 (hashes):
+                        HASH "location:entry::example-ruid-1" -> contact info
+                        HASH "location:usrdom::exampleuser:exampledomain" -> con
+tains (key:"location:entry::example-ruid-1" , value:"hash_value")
+                        HASH "location::index::usrdom" -> contains (key:"locatio
+n:usrdom::exampleuser:exampledomain", value:"hash_value")
+                        HASH "location:timer::YYYY-MM-DD mm:ss:mm" -> contains (
+key:"location:entry::example-ruid-1", value:"hash_value")
+                        HASH "location::index::timer" -> contains (key:"location
+:timer::YYYY-MM-DD mm:ss:mm", value:"hash_value")
+
+2. Limitations
+
+     * This module has implemented equivalent underlying Redis operations
+       for INSERT, UPDATE, DELETE and SELECT. The ORDER BY clause for
+       SELECT is not implemented. Raw querying is not implemented inside
+       this module; for sending literal commands to the Redis server, use
+       ndb_redis.
+
+3. Dependencies
+
+   3.1. Kamailio Modules
+   3.2. External Libraries or Applications
+
+3.1. Kamailio Modules
+
+   The following modules must be loaded before this module:
+     * none.
+
+3.2. External Libraries or Applications
+
+   The following libraries or applications must be installed before
+   running Kamailio with this module loaded:
+     * hiredis - available at https://github.com/redis/hiredis
+
+   The following library is an optional dependency to support redis
+   cluster protocol:
+     * hiredis-cluster - available at
+       https://github.com/Nordix/hiredis-cluster
+
+4. Parameters
+
+   4.1. schema_path (string)
+   4.2. keys (string)
+   4.3. verbosity (int)
+   4.4. opt_tls (int)
+   4.5. max_key_length (int)
+   4.6. mapping_struct_type (int)
+   4.7. hash_value (string)
+   4.8. hash_expires (int)
+   4.9. db_pass (string)
+   4.10. ca_path (string)
+   4.11. with_sentinels (int)
+   4.12. sentinels_config (string)
+   4.13. redis_master_name (string)
+   4.14. use_replicas (int)
+   4.15. recheck_replicas_interval (int)
+
+4.1. schema_path (string)
+
+   The path to the table schemas.
+
+   Default value: "/usr/share/kamailio/db_redis".
+
+   Example 1.1. Setting schema_path module parameter
+...
+modparam("db_redis", "schema_path", "/usr/local/share/kamailio/db_redis/kamailio
+")
+...
+
+4.2. keys (string)
+
+   The entry and mapping keys of tables.
+
+   Default value: "" (empty).
+
+   Example 1.2. Setting keys module parameter
+...
+modparam("db_redis", "keys", "version=entry:table_name;location=entry:ruid&usrdo
+m:username,domain&timer:partition,keepalive")
+...
+
+4.3. verbosity (int)
+
+   Control the verbosity of debug messages printed by the module. If set
+   to 1, the module prints schema details for all tables on each connect
+   operation to Redis server.
+
+   Default value: 1.
+
+   Example 1.3. Setting verbosity module parameter
+...
+modparam("db_redis", "verbosity", 0)
+...
+
+4.4. opt_tls (int)
+
+   Controls TLS usage while connecting to a remote DB. If set to 1, TLS is
+   used to connect to the DB.
+
+   If TLS is enabled, the module will validate the Redis server
+   certificate against the ca_path. There is currently no way to connect
+   with a specified client certificate, the corresponding configuration to
+   check client certificates in the Redis server must therefore be turned
+   off.
+
+   Default value: 0.
+
+   Example 1.4. Enabling TLS connection
+...
+modparam("db_redis", "opt_tls", 1)
+...
+
+4.5. max_key_length (int)
+
+   Controls the max possible key length to be used when adding/prepending
+   strings into the redis key. If used will be always compared against the
+   given string key length.
+
+   Default value: 0. Means disabled.
+
+   Example 1.5. Limiting the max key length
+...
+modparam("db_redis", "max_key_length", 4096)
+...
+
+4.6. mapping_struct_type (int)
+
+   Controls the type of mapping structures to be used. Beforehand, only
+   sets were used. For the rationale behind mapping structures, see the
+   discussion about mapping structures in the overview section. Currently
+   supported values: 0 - sets (default), 1 - hashes.
+
+   Motivation of hashes is the implementation of HEXPIRE command in Redis,
+   available since Redis v 7.4.0 onwards, which allows expiring individual
+   keys inside hashes.
+
+   Default value: 0.
+
+   Example 1.6. Enabling redis hashes
+...
+modparam("db_redis", "mapping_struct_type", 1)
+...
+
+4.7. hash_value (string)
+
+   Only has sense if mapping_struct_type is set to hash (1). Defines the
+   value to be used for the hash entries in the hashes that now replace
+   mapping sets.
+
+   Default value: DUMMY.
+
+   Example 1.7. Setting hash_value
+...
+modparam("db_redis", "hash_value", "DUMMY")
+...
+
+4.8. hash_expires (int)
+
+   Set an expiration time in seconds for the keys in the hash data
+   structures in the database. This is useful for the usrloc module for
+   example, for automatic contact expiry. A value of 0 is interpreted as
+   no expiration. This is only supported with mapping_struct_type set to
+   hash (1).
+
+   Default value: 0.
+
+   Example 1.8. Setting hash expires
+...
+modparam("db_redis", "hash_expires", 3600)
+...
+
+4.9. db_pass (string)
+
+   Sets the password to connect to the DB.
+
+   Default value: "" (empty).
+
+   Example 1.9. Setting a password
+...
+modparam("db_redis", "db_pass", "r3d1sPass")
+...
+
+4.10. ca_path (string)
+
+   Sets the path where Certificates Authorities certs for the Redis server
+   certificate are stored.
+
+   Default value: "" (empty).
+
+   Example 1.10. Setting CA path
+...
+modparam("db_redis", "ca_path", "/etc/ssl/certs")
+...
+
+4.11. with_sentinels (int)
+
+   Enables the use of Redis sentinels for high availability. If set to 1,
+   the module will connect to the Redis server using the sentinels defined
+   in the "sentinels_config" modparam.
+
+   Default value: 0.
+
+   Example 1.11. Enabling sentinels
+...
+modparam("db_redis", "with_sentinels", 1)
+...
+
+4.12. sentinels_config (string)
+
+   Sets the sentinels to connect to the Redis server. The format is
+   semi-colon separated list of key-value pairs: password, sentinels.
+   Sentinels is a pipe separated list of host:port pairs. Password applies
+   to all sentinels.
+
+   Default value: "" (empty).
+
+   Example 1.12. Setting sentinels
+...
+modparam("db_redis", "sentinels_config", "password=password;sentinels=host1:port
+1|host2:port2|host3:port3")
+...
+
+4.13. redis_master_name (string)
+
+   Sets the name of the Redis master. This is needed when building the
+   SENTINEL get-master-addr-by-name command. The name should match the
+   name used in the Redis Sentinel configuration.
+
+   Default value: "mymaster" (empty).
+
+   Example 1.13. Setting Redis master name
+...
+modparam("db_redis", "redis_master_name", "mymaster")
+...
+
+4.14. use_replicas (int)
+
+   Enables connecting to Redis replicas instead of the master when using
+   sentinels. Replicas are selected randomly. This helps distribute load
+   across the Redis setup (i.e.: read from replicas instead of master). If
+   for whatever reason no replicas are available, the module will fall
+   back to connecting to the master (this cannot be toggled off).
+
+   Default value: 0 (connect to master).
+
+   Example 1.14. Setting use_replicas
+...
+modparam("db_redis", "use_replicas", 1)
+...
+
+4.15. recheck_replicas_interval (int)
+
+   The parameter sets the interval in seconds to recheck for available
+   replicas so that we don't remain connected to the master. Because of
+   implementation details, the first check can exceptionally happen after
+   half of this interval. If set to 0, no rechecks will be performed and
+   the module will remain connected to the master until a new connection
+   is established (i.e.: Redis server goes down and comes back up).
+
+   Default value: 120 seconds.
+
+   Example 1.15. Setting use_replicas
+...
+modparam("db_redis", "recheck_replicas_interval", 120)
+...
+
+5. Usage
+
+   Load the module and set the "db_url" modparam for specific modules to:
+   'redis://[username]@host:port/database'. Username is optional. The
+   database portion must be a valid Redis database number.
+
+   For cluster support you need to set the "db_url" modparam with a comma
+   separated list of cluster hosts: 'redis://host1:port1,host2:port2/'.
+   The database portion is not supported in cluster mode.
+
+   If accessed DB requires TLS connections, you need to enable TLS support
+   setting the "opt_tls" parameter to 1. In case the DB requires a
+   password, that should be set using the "db_pass" parameter.
+
+   Example 1.16. Usage
+...
+loadmodule "db_redis.so"
+...
+#!define DBURL_USRLOC "redis://127.0.0.1:6379/5"
+#!define DBURL_ACC    "redis://127.0.0.1:6379/6"
+#!define DBURL_AUTH   "redis://127.0.0.1:6379/7"
+#!define DBURL_PERM   "redis://127.0.0.1:6379/8"
+#!define DBURL_DLG    "redis://127.0.0.1:6379/9"
+...
+modparam("db_redis", "schema_path", "/usr/share/kamailio/db_redis/kamailio")
+modparam("db_redis", "keys", "version=entry:table_name")
+modparam("db_redis", "keys", "location=entry:ruid&usrdom:username,domain&timer:p
+artition,keepalive")
+modparam("db_redis", "keys", "acc=entry:callid,time_hires&cid:callid")
+modparam("db_redis", "keys", "subscriber=entry:username,domain")
+modparam("db_redis", "keys", "dialog=entry:hash_entry,hash_id&cid:callid")
+modparam("db_redis", "keys", "dialog_vars=entry:hash_entry,hash_id,dialog_key&di
+alog:hash_entry,hash_id")
+...
+modparam("usrloc", "db_url", DBURL_USRLOC)
+...
+modparam("acc_db", "db_url", DBURL_ACC)
+...
+modparam("auth_db", "db_url", DBURL_AUTH)
+...
+modparam("permissions", "db_url", DBURL_PERM)
+...
+modparam("dialog", "db_url", DBURL_DLG)
+...
+
+   Samples adding records for address table using 'redis-cli':
+
+   Example 1.17. Usage
+...
+SELECT 8
+HMSET address:entry::1 id 1 grp 1 ip_addr "127.0.0.1" mask 32 port 0
+HMSET address:entry::2 id 2 grp 1 ip_addr "127.0.0.2" mask 32 port 0
+HMSET address:entry::3 id 3 grp 2 ip_addr "127.0.0.3" mask 32 port 0
+HMSET address:entry::4 id 4 grp 2 ip_addr "127.0.0.4" mask 32 port 0 tag "test"
+...
+
+   Note that is some cases, the optional values in database tables can be
+   omitted. For 'address' table, the 'tag' value may be omitted. To avoid
+   any issues, set unused fields to their default values as defined by
+   database schema. When definition allows 'NULL', that field can be
+   unset.
+
+6. Module Specific Considerations
+
+   6.1. usrloc
+
+6.1. usrloc
+
+   If you set "expires_type" to "1" in order to use BIGINT instead of
+   DATETIME, make sure to update your location schema file and change the
+   type of "expires" and "last_modified" from "time" to "int".

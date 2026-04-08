@@ -1,0 +1,29 @@
+#!/bin/bash
+#
+# Target dist: Debian trixie
+DIST=trixie
+
+rm -rf ${DIST}
+cp -r debian ${DIST}
+
+# no python2
+sed -i -e '/^ python,/d' -e '/python-dev/d' \
+  -e '/^Package: kamailio-python-modules/,/^$/d' \
+  ${DIST}/control
+sed -i -e '/^PACKAGE_GROUPS += python$/d' ${DIST}/rules
+sed -i -e '/--EXCLUDED--/i EXTRA_EXCLUDED_MODULES += python' ${DIST}/rules
+
+# no lsb-base
+sed -i -e '/lsb-base/d' ${DIST}/control
+
+# libncurses
+sed -i -e 's/libncurses5-dev/libncurses-dev/g' ${DIST}/control
+
+# latest higher lua version available
+sed -i -e 's/liblua5.5-dev/liblua5.4-dev/g' ${DIST}/control
+
+wrap-and-sort -sat -d ${DIST}
+
+# clean backports scripts
+rm -rf ${DIST}/backports
+exit 0

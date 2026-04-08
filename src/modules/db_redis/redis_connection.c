@@ -1,0 +1,780 @@
+/*
+ * Copyright (C) 2018 Andreas Granig (sipwise.com)
+ *
+ * This file is part of Kamailio, a free SIP server.
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * Kamailio is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version
+ *
+ * Kamailio is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ */
+
+#include <stdlib.h>
+
+#include "db_redis_mod.h"
+#include "redis_connection.h"
+#include "redis_sentinels.h"
+#include "redis_table.h"
+#include "redis_dbase.h"
+
+#ifdef WITH_HIREDIS_CLUSTER
+static unsigned int MAX_URL_LENGTH = 1023;
+#define redisCommand redisClusterCommand
+#define redisFree redisClusterFree
+#define redisCommandArgv redisClusterCommandArgv
+#define redisAppendCommandArgv redisClusterAppendCommandArgv
+#define redisGetReply redisClusterGetReply
+#endif
+
+extern int db_redis_verbosity;
+extern int mapping_struct_type;
+extern str db_redis_hash_expires_str;
+#ifdef WITH_SSL
+extern int db_redis_opt_tls;
+extern char *db_redis_ca_path;
+#endif
+
+static void print_query(redis_key_t *query)
+{
+	redis_key_t *k;
+
+	LM_DBG("Query dump:\n");
+	for(k = query; k; k = k->next) {
+		LM_DBG("  %s\n", k->key.s);
+	}
+}
+
+static int db_redis_push_query(km_redis_con_t *con, redis_key_t *query)
+{
+
+	redis_command_t *cmd = NULL;
+	redis_command_t *tmp = NULL;
+	redis_key_t *new_query = NULL;
+
+	if(!query)
+		return 0;
+
+	cmd = (redis_command_t *)pkg_malloc(sizeof(redis_command_t));
+	if(!cmd) {
+		LM_ERR("Failed to allocate memory for redis command\n");
+		goto err;
+	}
+
+	// duplicate query, as original one might be free'd after being
+	// appended
+	while(query) {
+		if(db_redis_key_add_str(&new_query, &query->key) != 0) {
+			LM_ERR("Failed to duplicate query\n");
+			goto err;
+		}
+		query = query->next;
+	}
+
+	cmd->query = new_query;
+	cmd->next = NULL;
+
+	if(!con->command_queue) {
+		con->command_queue = cmd;
+	} else {
+		tmp = con->command_queue;
+		while(tmp->next)
+			tmp = tmp->next;
+		tmp->next = cmd;
+	}
+
+	return 0;
+
+err:
+	if(new_query) {
+		db_redis_key_free(&new_query);
+	}
+	if(cmd) {
+		pkg_free(cmd);
+	}
+	return -1;
+}
+
+static redis_key_t *db_redis_shift_query(km_redis_con_t *con)
+{
+	redis_command_t *cmd;
+	redis_key_t *query;
+
+	query = NULL;
+	cmd = con->command_queue;
+
+	if(cmd) {
+		query = cmd->query;
+		con->command_queue = cmd->next;
+		pkg_free(cmd);
+	}
+
+	return query;
+}
+
+static inline int redis_supports_expires(int major, int minor, int patch)
+{
+	if(!(major > 7 || (major == 7 && minor >= 4)))
+		return 0;
+	return 1;
+}
+
+int db_redis_connect(km_redis_con_t *con)
+{
+	struct timeval tv;
+	redisReply *reply;
+	redisContext *sentinel_ctx = NULL;
+	int try_replicas = use_replicas;
+
+#ifndef WITH_HIREDIS_CLUSTER
+	int db;
+#endif
+#ifdef WITH_SSL
+	redisSSLContext *ssl = NULL;
+#endif
+	tv.tv_sec = 1;
+	tv.tv_usec = 0;
+#ifndef WITH_HIREDIS_CLUSTER
+	db = atoi(con->id->database);
+#endif
+	reply = NULL;
+
+	if(con->con) {
+		LM_DBG("free old connection first\n");
+		redisFree(con->con);
+	}
+
+	// TODO: introduce require_master mod-param and check if we're indeed master
+	// TODO: on carrier, if we have db fail-over, the currently connected
+	// redis server will become slave without dropping connections?
+#ifdef WITH_HIREDIS_CLUSTER
+	int status;
+	char hosts[MAX_URL_LENGTH];
+	char *host_begin;
+	char *host_end;
+	LM_DBG("connecting to redis cluster at %.*s\n", con->id->url.len,
+			con->id->url.s);
+	host_begin = strstr(con->id->url.s, "redis://");
+	if(host_begin) {
+		host_begin += 8;
+	} else {
+		LM_ERR("invalid url scheme\n");
+		goto err;
+	}
+
+#ifdef WITH_SSL
+	if(db_redis_opt_tls != 0) {
+		/* Create SSL context*/
+		redisInitOpenSSL();
+		ssl = redisCreateSSLContext(
+				NULL, db_redis_ca_path, NULL, NULL, NULL, NULL);
+		if(ssl == NULL) {
+			LM_ERR("Unable to create Redis SSL Context.\n");
+			goto err;
+		}
+	}
+#endif
+
+	host_end = strstr(host_begin, "/");
+	if(!host_end) {
+		LM_ERR("invalid url: cannot find end of host part\n");
+		goto err;
+	}
+	if((host_end - host_begin) > (MAX_URL_LENGTH - 1)) {
+		LM_ERR("url too long\n");
+		goto err;
+	}
+	strncpy(hosts, host_begin, (host_end - host_begin));
+	hosts[MAX_URL_LENGTH - 1] = '\0';
+	con->con = redisClusterContextInit();
+	if(!con->con) {
+		LM_ERR("no private memory left\n");
+		goto err;
+	}
+	redisClusterSetOptionAddNodes(con->con, hosts);
+	redisClusterSetOptionConnectTimeout(con->con, tv);
+#ifdef WITH_SSL
+	if(ssl) {
+		redisClusterSetOptionEnableSSL(con->con, ssl);
+	}
+#endif
+	status = redisClusterConnect2(con->con);
+	if(status != REDIS_OK) {
+		LM_ERR("cannot open connection to cluster with hosts: %s, error: %s\n",
+				hosts, con->con->errstr);
+		goto err;
+	}
+#else
+	if(db_redis_with_sentinels) {
+		redis_sentinel_t *sentinel;
+		int select_status, srv_found = 0;
+
+	recheck_sentinels:
+		for(sentinel = db_redis_sc.sentinel_list; sentinel != NULL;
+				sentinel = sentinel->next) {
+			struct timeval timeout;
+			timeout.tv_sec = 0;
+			timeout.tv_usec = 500000;
+
+			LM_INFO("Connecting to sentinel %s:%d\n", sentinel->host,
+					sentinel->port);
+			sentinel_ctx = redisConnectWithTimeout(
+					sentinel->host, sentinel->port, timeout);
+
+			if(!sentinel_ctx || sentinel_ctx->err) {
+				LM_ERR("Failed to create Redis context for sentinel %s:%d\n",
+						sentinel->host, sentinel->port);
+				if(sentinel_ctx) {
+					redisFree(sentinel_ctx);
+					sentinel_ctx = NULL;
+				}
+				continue;
+			}
+
+			if(db_redis_authenticate(sentinel_ctx, db_redis_sc.password) != 0) {
+				LM_ERR("Authentication error\n");
+				if(sentinel_ctx) {
+					redisFree(sentinel_ctx);
+					sentinel_ctx = NULL;
+				}
+				continue;
+			}
+
+			select_status = try_replicas
+									? db_redis_select_replica(sentinel_ctx, con)
+									: db_redis_select_master(sentinel_ctx, con);
+
+			if(select_status != 0) { // Failed to select master/replica
+				continue;
+			}
+
+			srv_found = 1;
+			break; // Successfully selected a server, break out of the loop
+		}
+		if(!srv_found) {
+			if(try_replicas) {
+				LM_ERR("Could not connect to any redis replica via sentinel, "
+					   "now defaulting to checking for master\n");
+				replica_list_free(&replica_list);
+				if(sentinel_ctx) {
+					redisFree(sentinel_ctx);
+					sentinel_ctx = NULL;
+				}
+				try_replicas = 0; // now try to connect to master
+				goto recheck_sentinels;
+			} else {
+				LM_ERR("Could not connect to any redis servers via sentinel\n");
+				goto err;
+			}
+		}
+	}
+	LM_INFO("connecting to redis at %s:%d\n", con->id->host, con->id->port);
+
+#ifdef WITH_SSL
+	if(db_redis_opt_tls != 0) {
+		/* Create SSL context*/
+		redisInitOpenSSL();
+		ssl = redisCreateSSLContext(
+				NULL, db_redis_ca_path, NULL, NULL, NULL, NULL);
+		if(ssl == NULL) {
+			LM_ERR("Unable to create Redis SSL Context.\n");
+			goto err;
+		}
+	}
+#endif
+
+	con->con = redisConnectWithTimeout(con->id->host, con->id->port, tv);
+	if(!con->con) {
+		LM_ERR("cannot open connection: %.*s\n", con->id->url.len,
+				con->id->url.s);
+		goto err;
+	}
+	if(con->con->err) {
+		LM_ERR("cannot open connection to %.*s: %s\n", con->id->url.len,
+				con->id->url.s, con->con->errstr);
+		goto err;
+	}
+#ifdef WITH_SSL
+	if(ssl) {
+		redisInitiateSSLWithContext(con->con, ssl);
+	}
+#endif
+#endif
+	// Authenticate if needed
+	if(db_redis_authenticate(con->con, con->id->password) != 0) {
+		LM_ERR("Authentication error\n");
+		goto err;
+	}
+#ifndef WITH_HIREDIS_CLUSTER
+	reply = redisCommand(con->con, "PING");
+	if(!reply) {
+		LM_ERR("cannot ping server on connection %.*s: %s\n", con->id->url.len,
+				con->id->url.s, con->con->errstr);
+		goto err;
+	}
+	if(reply->type == REDIS_REPLY_ERROR) {
+		LM_ERR("cannot ping server on connection %.*s: %s\n", con->id->url.len,
+				con->id->url.s, reply->str);
+		goto err;
+	}
+	freeReplyObject(reply);
+	reply = NULL;
+
+	reply = redisCommand(con->con, "SELECT %i", db);
+	if(!reply) {
+		LM_ERR("cannot select db on connection %.*s: %s\n", con->id->url.len,
+				con->id->url.s, con->con->errstr);
+		goto err;
+	}
+	if(reply->type == REDIS_REPLY_ERROR) {
+		LM_ERR("cannot select db on connection %.*s: %s\n", con->id->url.len,
+				con->id->url.s, reply->str);
+		goto err;
+	}
+	freeReplyObject(reply);
+	reply = NULL;
+#endif
+	LM_DBG("connection opened to %.*s\n", con->id->url.len, con->id->url.s);
+
+#ifndef WITH_HIREDIS_CLUSTER
+	if(mapping_struct_type == MS_HASH) {
+		reply = redisCommand(con->con, "SCRIPT LOAD %s", HDEL_KEY_LUA);
+	} else {
+		reply = redisCommand(con->con, "SCRIPT LOAD %s", SREM_KEY_LUA);
+	}
+	if(!reply) {
+		LM_ERR("failed to load LUA script to server %.*s: %s\n",
+				con->id->url.len, con->id->url.s, con->con->errstr);
+		goto err;
+	}
+	if(reply->type == REDIS_REPLY_ERROR) {
+		LM_ERR("failed to load LUA script to server %.*s: %s\n",
+				con->id->url.len, con->id->url.s, reply->str);
+		goto err;
+	}
+	if(reply->type != REDIS_REPLY_STRING) {
+		LM_ERR("failed to load LUA script to server %.*s: %i\n",
+				con->id->url.len, con->id->url.s, reply->type);
+		goto err;
+	}
+	if(reply->len >= sizeof(con->srem_key_lua)) {
+		LM_ERR("failed to load LUA script to server %.*s: %i >= %i\n",
+				con->id->url.len, con->id->url.s, (int)reply->len,
+				(int)sizeof(con->srem_key_lua));
+		goto err;
+	}
+	strcpy(con->srem_key_lua, reply->str);
+	freeReplyObject(reply);
+	reply = NULL;
+
+	if(db_redis_hash_expires_str.len) {
+		char *version_str = NULL;
+		int major = 0, minor = 0, patch = 0;
+
+		reply = redisCommand(con->con, "INFO server");
+		if(!reply) {
+			LM_ERR("failed to get INFO from Redis server\n");
+			goto err;
+		}
+
+		version_str = strstr(reply->str, "redis_version:");
+		if(!version_str) {
+			LM_ERR("Redis version not found in INFO reply\n");
+			goto err;
+		}
+
+		version_str += strlen("redis_version:"); // Skip past the field name
+		if(sscanf(version_str, "%d.%d.%d", &major, &minor, &patch) < 3) {
+			LM_ERR("Error parsing the version string: %s\n", version_str);
+			goto err;
+		}
+
+		if(!redis_supports_expires(major, minor, patch)) {
+			LM_ERR("HEXPIRE (used by redis_expire parameter) is not "
+				   "implemented in Redis version %d.%d.%d\n.",
+					major, minor, patch);
+			goto err;
+		}
+
+		LM_DBG("Redis server version is: %d.%d.%d\n", major, minor, patch);
+		freeReplyObject(reply);
+		reply = NULL;
+	}
+#endif
+	LM_DBG("connection opened to %.*s\n", con->id->url.len, con->id->url.s);
+
+	return 0;
+
+err:
+	if(reply)
+		freeReplyObject(reply);
+	if(con->con) {
+		redisFree(con->con);
+		con->con = NULL;
+	}
+	if(sentinel_ctx)
+		redisFree(sentinel_ctx);
+	return -1;
+}
+
+/*! \brief
+ * Create a new connection structure,
+ * open the redis connection and set reference count to 1
+ */
+km_redis_con_t *db_redis_new_connection(const struct db_id *id)
+{
+	km_redis_con_t *ptr = NULL;
+
+	if(!id) {
+		LM_ERR("invalid id parameter value\n");
+		return 0;
+	}
+
+	ptr = (km_redis_con_t *)pkg_malloc(sizeof(km_redis_con_t));
+	if(!ptr) {
+		LM_ERR("no private memory left\n");
+		return 0;
+	}
+	memset(ptr, 0, sizeof(km_redis_con_t));
+	ptr->id = (struct db_id *)id;
+
+	/*
+	LM_DBG("trying to initialize connection to '%.*s' with schema path '%.*s' and keys '%.*s'\n",
+			id->url.len, id->url.s,
+			redis_schema_path.len, redis_schema_path.s,
+			redis_keys.len, redis_keys.s);
+	*/
+	LM_DBG("trying to initialize connection to '%.*s'\n", id->url.len,
+			id->url.s);
+	if(db_redis_parse_schema(ptr) != 0) {
+		LM_ERR("failed to parse 'schema' module parameter\n");
+		goto err;
+	}
+	if(db_redis_parse_keys(ptr) != 0) {
+		LM_ERR("failed to parse 'keys' module parameter\n");
+		goto err;
+	}
+
+	if(db_redis_verbosity > 0)
+		db_redis_print_all_tables(ptr);
+
+	ptr->ref = 1;
+	ptr->append_counter = 0;
+
+	if(db_redis_connect(ptr) != 0) {
+		LM_ERR("Failed to connect to redis db\n");
+		goto err;
+	}
+
+	LM_DBG("connection opened to %.*s\n", id->url.len, id->url.s);
+
+	return ptr;
+
+err:
+	if(ptr) {
+		if(ptr->con) {
+			redisFree(ptr->con);
+		}
+		pkg_free(ptr);
+	}
+	return 0;
+}
+
+
+/*! \brief
+ * Close the connection and release memory
+ */
+void db_redis_free_connection(struct pool_con *con)
+{
+	km_redis_con_t *_c;
+
+	LM_DBG("freeing db_redis connection\n");
+
+	if(!con)
+		return;
+
+	_c = (km_redis_con_t *)con;
+
+	if(_c->id)
+		free_db_id(_c->id);
+	if(_c->con) {
+		redisFree(_c->con);
+	}
+
+	db_redis_free_tables(_c);
+	pkg_free(_c);
+}
+
+#ifdef WITH_HIREDIS_CLUSTER
+void *db_redis_command_argv_to_node(
+		km_redis_con_t *con, redis_key_t *query, cluster_node *node)
+{
+	char **argv = NULL;
+	int argc;
+#define MAX_CMD_LENGTH 256
+	char cmd[MAX_CMD_LENGTH] = "";
+	size_t cmd_len = MAX_CMD_LENGTH - 1;
+	int i;
+
+	print_query(query);
+
+	argc = db_redis_key_list2arr(query, &argv);
+	if(argc < 0) {
+		LM_ERR("Failed to allocate memory for query array\n");
+		return NULL;
+	}
+	LM_DBG("query has %d args\n", argc);
+
+	for(i = 0; i < argc; i++) {
+		size_t arg_len = strlen(argv[i]);
+		if(arg_len > cmd_len)
+			break;
+		strncat(cmd, argv[i], cmd_len);
+		cmd_len = cmd_len - arg_len;
+		if(cmd_len == 0)
+			break;
+
+		if(i != argc - 1) {
+			strncat(cmd, " ", cmd_len);
+			cmd_len--;
+		}
+	}
+
+	LM_DBG("cmd is %s\n", cmd);
+
+	redisReply *reply = redisClusterCommandToNode(con->con, node, cmd);
+	if(con->con->err != REDIS_OK) {
+		LM_WARN("redis connection is gone, try reconnect. (%d:%s)\n",
+				con->con->err, con->con->errstr);
+		if(db_redis_connect(con) != 0) {
+			LM_ERR("Failed to reconnect to redis db\n");
+			pkg_free(argv);
+			if(con->con) {
+				redisFree(con->con);
+				con->con = NULL;
+			}
+			return NULL;
+		}
+		reply = redisClusterCommandToNode(con->con, node, cmd);
+	}
+	pkg_free(argv);
+	return reply;
+}
+
+#endif
+
+static inline int should_recheck_replicas(time_t crt_time)
+{
+	if(!using_master_read_only || !recheck_replicas_interval) {
+		return 0;
+	}
+
+	if(crt_time != last_seen_time
+			&& (crt_time - last_seen_time) > min_recheck_interval) {
+		last_seen_time = crt_time;
+		return 1;
+	}
+	return 0;
+}
+
+void *db_redis_command_argv(km_redis_con_t *con, redis_key_t *query)
+{
+	char **argv = NULL;
+	int argc;
+	redisReply *reply = NULL;
+	int reconnect_needed = 0;
+	time_t current_time;
+
+	print_query(query);
+
+	argc = db_redis_key_list2arr(query, &argv);
+	if(argc < 0) {
+		LM_ERR("Failed to allocate memory for query array\n");
+		return NULL;
+	}
+	LM_DBG("query has %d args\n", argc);
+
+	current_time = *db_redis_shared_time;
+	if(should_recheck_replicas(current_time)) {
+		LM_WARN("Reconnecting: redis master is being used for read-only "
+				"operations.\n");
+		last_seen_time = current_time;
+		reconnect_needed = 1;
+	} else {
+		reply = redisCommandArgv(con->con, argc, (const char **)argv, NULL);
+		if(con->con->err != REDIS_OK) {
+			LM_WARN("redis connection is gone, try reconnect. (%d:%s)\n",
+					con->con->err, con->con->errstr);
+			reconnect_needed = 1;
+		}
+	}
+
+	if(reconnect_needed) {
+		if(db_redis_connect(con) != 0) {
+			LM_ERR("Failed to reconnect to redis db\n");
+			pkg_free(argv);
+			if(con->con) {
+				redisFree(con->con);
+				con->con = NULL;
+			}
+			return NULL;
+		}
+		reply = redisCommandArgv(con->con, argc, (const char **)argv, NULL);
+	}
+	pkg_free(argv);
+	return reply;
+}
+
+int db_redis_append_command_argv(
+		km_redis_con_t *con, redis_key_t *query, int queue)
+{
+	char **argv = NULL;
+	int ret, argc;
+
+	print_query(query);
+
+	if(queue > 0 && db_redis_push_query(con, query) != 0) {
+		LM_ERR("Failed to queue redis command\n");
+		return -1;
+	}
+
+	argc = db_redis_key_list2arr(query, &argv);
+	if(argc < 0) {
+		LM_ERR("Failed to allocate memory for query array\n");
+		return -1;
+	}
+	LM_DBG("query has %d args\n", argc);
+
+	ret = redisAppendCommandArgv(con->con, argc, (const char **)argv, NULL);
+
+	// this should actually never happen, because if all replies
+	// are properly consumed for the previous command, it won't send
+	// out a new query until redisGetReply is called
+	if(con->con->err != REDIS_OK) {
+		LM_WARN("redis connection is gone, try reconnect. (%d:%s)\n",
+				con->con->err, con->con->errstr);
+		if(db_redis_connect(con) != 0) {
+			LM_ERR("Failed to reconnect to redis db\n");
+			pkg_free(argv);
+			if(con->con) {
+				redisFree(con->con);
+				con->con = NULL;
+			}
+			return ret;
+		}
+		ret = redisAppendCommandArgv(con->con, argc, (const char **)argv, NULL);
+	}
+	pkg_free(argv);
+	if(!con->con->err) {
+		con->append_counter++;
+	}
+	return ret;
+}
+
+int db_redis_get_reply(km_redis_con_t *con, void **reply)
+{
+	int ret;
+	redis_key_t *query;
+	int reconnect_needed = 0;
+	time_t current_time;
+
+	if(!con || !con->con) {
+		LM_ERR("Internal error passing null connection\n");
+		return -1;
+	}
+
+	current_time = *db_redis_shared_time;
+	if(should_recheck_replicas(current_time)) {
+		LM_WARN("Reconnecting: redis master is being used for read-only "
+				"operations.\n");
+		last_seen_time = current_time;
+		reconnect_needed = 1;
+	} else {
+		*reply = NULL;
+		ret = redisGetReply(con->con, reply);
+		if(con->con->err != REDIS_OK) {
+			LM_WARN("redis connection is gone, try reconnect. (%d:%s)\n",
+					con->con->err, con->con->errstr);
+			reconnect_needed = 1;
+		}
+	}
+
+	if(reconnect_needed) {
+		con->append_counter = 0;
+		if(db_redis_connect(con) != 0) {
+			LM_ERR("Failed to reconnect to redis db\n");
+			if(con->con) {
+				redisFree(con->con);
+				con->con = NULL;
+			}
+			return -1;
+		}
+		// take commands from oldest to newest and re-do again,
+		// but don't queue them once again in retry-mode
+		while((query = db_redis_shift_query(con))) {
+			LM_DBG("re-queueing appended command\n");
+			if(db_redis_append_command_argv(con, query, 0) != 0) {
+				LM_ERR("Failed to re-queue redis command");
+				return -1;
+			}
+			db_redis_key_free(&query);
+		}
+		ret = redisGetReply(con->con, reply);
+		if(con->con->err == REDIS_OK) {
+			con->append_counter--;
+		}
+	} else {
+		LM_DBG("get_reply successful, removing query\n");
+		query = db_redis_shift_query(con);
+		db_redis_key_free(&query);
+		con->append_counter--;
+	}
+	return ret;
+}
+
+void db_redis_free_reply(redisReply **reply)
+{
+	if(reply && *reply) {
+		freeReplyObject(*reply);
+		*reply = NULL;
+	}
+}
+
+void db_redis_consume_replies(km_redis_con_t *con)
+{
+	redisReply *reply = NULL;
+	redis_key_t *query;
+	while(con->append_counter > 0 && con->con && !con->con->err) {
+		LM_DBG("consuming outstanding reply %u", con->append_counter);
+		if(db_redis_get_reply(con, (void **)&reply) != REDIS_OK) {
+			LM_DBG("failure to get the reply\n");
+		}
+		if(reply) {
+			freeReplyObject(reply);
+			reply = NULL;
+		}
+	}
+	while((query = db_redis_shift_query(con))) {
+		LM_DBG("consuming queued command\n");
+		db_redis_key_free(&query);
+	}
+}
+
+const char *db_redis_get_error(km_redis_con_t *con)
+{
+	if(con && con->con && con->con->errstr[0]) {
+		return con->con->errstr;
+	} else {
+		return "<broken redis connection>";
+	}
+}

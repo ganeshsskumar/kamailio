@@ -1,0 +1,70 @@
+#
+#
+# control tool for maintaining Kamailio
+#
+# This file is part of Kamailio, a free SIP server.
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Kamailio is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version
+#
+# Kamailio is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+#
+#===================================================================
+
+##### ----------------------------------------------- #####
+### SQLITE specific variables and functions
+#
+
+##### ----------------------------------------------- #####
+### load SQL base
+#
+if [ -f "$MYLIBDIR/kamctl.sqlbase" ]; then
+	. "$MYLIBDIR/kamctl.sqlbase"
+else
+	echo "Cannot load SQL core functions '$MYLIBDIR/kamctl.sqlbase' - exiting ..."
+	exit -1
+fi
+
+DBNAME=$DB_PATH
+
+DATENOW=`date`
+DBFNOW="'$DATENOW'"
+
+##### ----------------------------------------------- #####
+### binaries
+if [ -z "$SQLITE" ] ; then
+	locate_tool sqlite3
+	if [ -z "$TOOLPATH" ] ; then
+		echo "error: 'sqlite3' tool not found: set SQLITE variable to correct tool path"
+		exit
+	fi
+	SQLITE="$TOOLPATH"
+fi
+
+
+# input: sql query, optional sqlite3 command-line params
+sqlite_query() {
+	# if password not yet queried, query it now
+	mecho "sqlite_query: $SQLITE $2 $DBNAME $1"
+	$SQLITE $2 $DBNAME "$1"
+}
+
+# input: sql query, optional sqlite3 command-line params
+sqlite_ro_query() {
+	sqlite_query "$@"
+}
+
+DBCMD=sqlite_query
+DBROCMD=sqlite_ro_query
+DBRAWPARAMS=
