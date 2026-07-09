@@ -174,9 +174,6 @@
 INT8 gsi8Appname[APP_NAME_BUFFER_SIZE] ="IMS";
 INT8 gsi8TOC[TOC_BUFFER_SIZE] ="Fri 2026-02-6 11:00:40 UTC";
 
-#define LICENSE_HELPER_PATH "/usr/local/sbin/license_check_helper"
-#define LICENSE_RECHECK_INTERVAL_SEC (60 * 3)   /* test interval; raise before production */
-
 /*License Header */
 #endif
 
@@ -2212,26 +2209,6 @@ static int calc_proc_no(void)
 					;
 }
 
-#ifdef ENABLE_LICENSE_CHECK
-static void *license_monitor_thread(void *arg)
-{
-    while (1) {
-        sleep(LICENSE_RECHECK_INTERVAL_SEC);
-
-        int rc = system(LICENSE_HELPER_PATH);
-
-        if (rc != 0) {
-            printf("License validation failed. Stopping Kamailio...\n");
-            kill(getpid(), SIGTERM);
-            sleep(5);
-            exit(EXIT_FAILURE);
-        }
-
-        printf("Periodic license recheck passed\n");
-    }
-    return NULL;
-}
-#endif
 int main(int argc, char **argv)
 {
 
@@ -2318,14 +2295,6 @@ int main(int argc, char **argv)
     if (status != LICENSE_VALID) {
         printf("License Expired...!, Closing the app\n");
         exit(1);
-    }
-	
-	pthread_t license_tid;
-    if (pthread_create(&license_tid, NULL, license_monitor_thread, NULL) == 0) {
-        pthread_detach(license_tid);
-    } else {
-        printf("Failed to start license monitoring thread\n");
-        exit(EXIT_FAILURE);
     }
 	/* License code */
 	#endif
