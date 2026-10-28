@@ -78,9 +78,8 @@ enum SMS_DATA
 	SMS_TPDU_DESTINATION_FLAGS,
 	SMS_RPDATA_ORIGINATOR_FLAGS,
 	SMS_RPDATA_DESTINATION_FLAGS,
-	SMS_RPDATA_DESTINATION_FLAGS,
 	SMS_TPDU_SCTS,
-    SMS_TPDU_STATUS
+	SMS_TPDU_STATUS
 };
 
 // Types of the PDU-Message
@@ -694,15 +693,12 @@ static int DecodePhoneNumber(char *buffer, int len, str phone)
 	return i;
 }
 
-// Generate a 7 Byte Long Time
 // Generate a 7 Byte Long Time from a given (GMT) unix timestamp.
-static void EncodeTimeTS(time_t ts,char *buffer)
+static void EncodeTimeTS(time_t ts, char *buffer)
 {
-	time_t ts;
 	struct tm now;
 	int i = 0;
 
-	time(&ts);
 	/* Get GMT time */
 	gmtime_r(&ts, &now);
 
